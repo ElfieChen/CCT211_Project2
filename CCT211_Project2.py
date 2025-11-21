@@ -2,13 +2,12 @@
 """
 Condo Amenity & Service Hub - improved implementation with role-based UI
 Matches the proposal: login -> dashboard -> (amenities, packages, service requests, announcements)
-Uses JSON for persistence.
+Uses SQLite for persistence.
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-import json
-import os
+import sqlite3
 from datetime import datetime
 
 
@@ -25,9 +24,17 @@ class User:
 
 
 class AmenityBooking:
-    def __init__(self, booking_id: int, unit: str, facility_type: str,
-                 date_str: str, start_time: str, end_time: str,
-                 status: str = "Booked", created_by: str = ""):
+    def __init__(
+        self,
+        booking_id: int,
+        unit: str,
+        facility_type: str,
+        date_str: str,
+        start_time: str,
+        end_time: str,
+        status: str = "Booked",
+        created_by: str = "",
+    ):
         self.id = booking_id
         self.unit = unit
         self.facility_type = facility_type
@@ -153,72 +160,251 @@ class Announcement:
         )
 
 
-# ------------------------- Persistence Layer ------------------------- #
+# ------------------------- Persistence Layer (SQLite) ------------------------- #
 
 class DataStore:
-    """JSON-based persistence for all entities."""
+    """SQLite-based persistence for all entities."""
 
-    def __init__(self, filename: str = "condo_data.json"):
-        self.filename = filename
-        self.data = {
-            "users": [],
-            "amenity_bookings": [],
-            "packages": [],
-            "service_requests": [],
-            "announcements": [],
-        }
-        self.load()
+    def __init__(self, filename: str = "condo_data.sqlite3"):
+        # 连接数据库（没有会自动创建）
+        self.conn = sqlite3.connect(filename)
+        self.conn.row_factory = sqlite3.Row
+        self._init_db()
 
-    def load(self) -> None:
-        if os.path.exists(self.filename):
-            try:
-                with open(self.filename, "r", encoding="utf-8") as f:
-                    d = json.load(f)
-                for key in self.data:
-                    if key in d and isinstance(d[key], list):
-                        self.data[key] = d[key]
-            except (IOError, json.JSONDecodeError):
-                # start with empty data if file is corrupted
-                pass
+    def _init_db(self) -> None:
+        """Create tables if not exist."""
+        cur = self.conn.cursor()
+
+        # Amenity bookings
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS amenity_bookings (
+                id            INTEGER PRIMARY KEY,
+                unit          TEXT NOT NULL,
+                facility_type TEXT NOT NULL,
+                date          TEXT NOT NULL,
+                start_time    TEXT NOT NULL,
+                end_time      TEXT NOT NULL,
+                status        TEXT NOT NULL,
+                created_by    TEXT
+            )
+        """)
+
+        # Packages
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS packages (
+                id           INTEGER PRIMARY KEY,
+                unit         TEXT NOT NULL,
+                carrier      TEXT NOT NULL,
+                arrival_date TEXT NOT NULL,
+                picked_up    INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        # Service requests
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS service_requests (
+                id          INTEGER PRIMARY KEY,
+                unit        TEXT NOT NULL,
+                req_type    TEXT NOT NULL,
+                description TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                created_by  TEXT
+            )
+        """)
+
+        # Announcements
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS announcements (
+                id         INTEGER PRIMARY KEY,
+                title      TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        self.conn.commit()
 
     def save(self) -> None:
+        """Commit pending changes to disk."""
+        self.conn.commit()
+
+    def __del__(self):
         try:
-            with open(self.filename, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2)
-        except IOError as e:
-            print("Error saving data:", e)
+            self.conn.close()
+        except Exception:
+            pass
+
+    # ------------- ID helper ------------- #
 
     def next_id(self, key: str) -> int:
-        items = self.data.get(key, [])
-        if not items:
-            return 1
-        return max(item.get("id", 0) for item in items) + 1
+        """Return next integer id for a given logical table key."""
+        table = {
+            "amenity_bookings": "amenity_bookings",
+            "packages": "packages",
+            "service_requests": "service_requests",
+            "announcements": "announcements",
+        }.get(key)
 
-    # Convenience getters/setters
+        if table is None:
+            raise ValueError(f"Unknown key for next_id: {key}")
+
+        cur = self.conn.execute(f"SELECT MAX(id) AS max_id FROM {table}")
+        row = cur.fetchone()
+        max_id = row["max_id"] if row and row["max_id"] is not None else 0
+        return max_id + 1
+
+    # ------------- Amenity bookings ------------- #
 
     def get_amenity_bookings(self):
-        return [AmenityBooking.from_dict(d) for d in self.data["amenity_bookings"]]
+        cur = self.conn.execute(
+            """
+            SELECT id, unit, facility_type, date, start_time, end_time, status, created_by
+            FROM amenity_bookings
+            ORDER BY date, start_time, id
+            """
+        )
+        rows = cur.fetchall()
+        return [AmenityBooking.from_dict(dict(row)) for row in rows]
 
     def set_amenity_bookings(self, bookings):
-        self.data["amenity_bookings"] = [b.to_dict() for b in bookings]
+        # 这里保持和原 JSON 版本一样的“整表覆盖”语义
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM amenity_bookings")
+        cur.executemany(
+            """
+            INSERT INTO amenity_bookings
+            (id, unit, facility_type, date, start_time, end_time, status, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    b.id,
+                    b.unit,
+                    b.facility_type,
+                    b.date,
+                    b.start_time,
+                    b.end_time,
+                    b.status,
+                    b.created_by,
+                )
+                for b in bookings
+            ],
+        )
+
+    # ------------- Packages ------------- #
 
     def get_packages(self):
-        return [PackageRecord.from_dict(d) for d in self.data["packages"]]
+        cur = self.conn.execute(
+            """
+            SELECT id, unit, carrier, arrival_date, picked_up
+            FROM packages
+            ORDER BY arrival_date DESC, id DESC
+            """
+        )
+        rows = cur.fetchall()
+        result = []
+        for row in rows:
+            result.append(
+                PackageRecord.from_dict(
+                    {
+                        "id": row["id"],
+                        "unit": row["unit"],
+                        "carrier": row["carrier"],
+                        "arrival_date": row["arrival_date"],
+                        "picked_up": bool(row["picked_up"]),
+                    }
+                )
+            )
+        return result
 
     def set_packages(self, packages):
-        self.data["packages"] = [p.to_dict() for p in packages]
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM packages")
+        cur.executemany(
+            """
+            INSERT INTO packages
+            (id, unit, carrier, arrival_date, picked_up)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    p.id,
+                    p.unit,
+                    p.carrier,
+                    p.arrival_date,
+                    int(p.picked_up),
+                )
+                for p in packages
+            ],
+        )
+
+    # ------------- Service requests ------------- #
 
     def get_service_requests(self):
-        return [ServiceRequest.from_dict(d) for d in self.data["service_requests"]]
+        cur = self.conn.execute(
+            """
+            SELECT id, unit, req_type, description, status, created_by
+            FROM service_requests
+            ORDER BY id DESC
+            """
+        )
+        rows = cur.fetchall()
+        return [ServiceRequest.from_dict(dict(row)) for row in rows]
 
     def set_service_requests(self, requests):
-        self.data["service_requests"] = [r.to_dict() for r in requests]
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM service_requests")
+        cur.executemany(
+            """
+            INSERT INTO service_requests
+            (id, unit, req_type, description, status, created_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    r.id,
+                    r.unit,
+                    r.req_type,
+                    r.description,
+                    r.status,
+                    r.created_by,
+                )
+                for r in requests
+            ],
+        )
+
+    # ------------- Announcements ------------- #
 
     def get_announcements(self):
-        return [Announcement.from_dict(d) for d in self.data["announcements"]]
+        cur = self.conn.execute(
+            """
+            SELECT id, title, content, created_at
+            FROM announcements
+            ORDER BY id
+            """
+        )
+        rows = cur.fetchall()
+        return [Announcement.from_dict(dict(row)) for row in rows]
 
     def set_announcements(self, announcements):
-        self.data["announcements"] = [a.to_dict() for a in announcements]
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM announcements")
+        cur.executemany(
+            """
+            INSERT INTO announcements
+            (id, title, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    a.id,
+                    a.title,
+                    a.content,
+                    a.created_at,
+                )
+                for a in announcements
+            ],
+        )
 
 
 # ------------------------- Utility Functions ------------------------- #
@@ -471,7 +657,7 @@ class AmenityWindow(tk.Toplevel):
         tk.Button(btn_frame, text="Cancel", width=10, command=self.cancel_booking).pack(side="left", padx=3)
         tk.Button(btn_frame, text="Delete", width=10, command=self.delete_booking).pack(side="left", padx=3)
 
-        # Listbox for bookings (simplified but larger)
+        # Listbox for bookings
         self.listbox = tk.Listbox(self, height=16)
         self.listbox.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -748,7 +934,7 @@ class PackageWindow(tk.Toplevel):
     def filtered_packages(self):
         # Resident can only see their own unit's packages
         pkgs = self.packages
-        if not self.user.is_admin() and self.user.unit:
+        if (not self.user.is_admin()) and self.user.unit:
             pkgs = [p for p in pkgs if p.unit == self.user.unit]
 
         prefix = self.search_var.get().strip()
@@ -942,7 +1128,7 @@ class ServiceRequestWindow(tk.Toplevel):
         self.listbox.pack(fill="both", expand=True, padx=10, pady=(0, 5))
         self.listbox.bind("<<ListboxSelect>>", self.show_details)
 
-        # Details area to show full description so this window looks different
+        # Details area to show full description
         details_frame = tk.LabelFrame(self, text="Details", padx=5, pady=5)
         details_frame.pack(fill="both", expand=False, padx=10, pady=(0, 10))
 
@@ -963,24 +1149,23 @@ class ServiceRequestWindow(tk.Toplevel):
             txt = f"#{r.id} | Unit {r.unit} | {r.req_type} | {r.status}"
             self.listbox.insert(tk.END, txt)
 
-        self.show_details()  # clear / refresh details
+        self.show_details()
 
     def show_details(self, event=None):
         self.detail_text.config(state="normal")
         self.detail_text.delete("1.0", "end")
-        r = self.get_selected()
-        if r:
-            self.detail_text.insert("1.0", r.description)
+        idx = self.listbox.curselection()
+        if idx:
+            req = self.current_view[idx[0]]
+            text = f"Unit: {req.unit}\nType: {req.req_type}\nStatus: {req.status}\n\n{req.description}"
+            self.detail_text.insert("1.0", text)
         self.detail_text.config(state="disabled")
 
     def get_selected(self):
         idx = self.listbox.curselection()
         if not idx:
             return None
-        index = idx[0]
-        if 0 <= index < len(self.current_view):
-            return self.current_view[index]
-        return None
+        return self.current_view[idx[0]]
 
     def new_request(self):
         ServiceRequestForm(self, self.store, on_save=self.on_saved, request=None)
@@ -990,8 +1175,9 @@ class ServiceRequestWindow(tk.Toplevel):
         if not r:
             messagebox.showwarning("Select", "Please select a request.")
             return
+        # Residents 只能编辑自己提交的
         if (not self.user.is_admin()) and r.created_by != self.user.username:
-            messagebox.showerror("Permission", "You can only edit requests that you submitted.")
+            messagebox.showerror("Permission", "You can only edit your own requests.")
             return
         ServiceRequestForm(self, self.store, on_save=self.on_saved, request=r)
 
@@ -1024,12 +1210,6 @@ class ServiceRequestWindow(tk.Toplevel):
                 break
         self.save_and_refresh()
 
-        if self.user.is_admin():
-            messagebox.showinfo(
-                "Resident notified",
-                f"Resident in Unit {req.unit} has been notified about the status update."
-            )
-
     def on_saved(self, req: ServiceRequest, is_new: bool):
         if is_new:
             self.requests.append(req)
@@ -1055,7 +1235,7 @@ class ServiceRequestForm(tk.Toplevel):
         self.on_save = on_save
         self.request = request
 
-        self.geometry("380x280")
+        self.geometry("360x260")
 
         tk.Label(self, text="Unit:").grid(row=0, column=0, sticky="w", padx=10, pady=5)
         self.unit_entry = tk.Entry(self)
@@ -1076,15 +1256,15 @@ class ServiceRequestForm(tk.Toplevel):
         tk.Button(btn_frame, text="Save", command=self.save).pack(side="left", padx=5)
         tk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=5)
 
-        user = getattr(master, "user", None)
-
+        # Pre-fill data
         if self.request:
             self.unit_entry.insert(0, self.request.unit)
             self.type_var.set(self.request.req_type)
             self.desc_text.insert("1.0", self.request.description)
         else:
-            # For resident, prefill their unit and lock it
-            if user and not user.is_admin() and user.unit:
+            # For residents, auto-fill unit
+            user = master.user
+            if (not user.is_admin()) and user.unit:
                 self.unit_entry.insert(0, user.unit)
                 self.unit_entry.config(state="disabled")
 
@@ -1100,15 +1280,21 @@ class ServiceRequestForm(tk.Toplevel):
         if self.request:
             req_id = self.request.id
             status = self.request.status
-            creator = self.request.created_by
+            created_by = self.request.created_by
         else:
             req_id = self.store.next_id("service_requests")
             status = "Submitted"
-            user = getattr(self.master, "user", None)
-            creator = user.username if user is not None else ""
+            user = self.master.user
+            created_by = user.username if user is not None else ""
 
-        req = ServiceRequest(req_id=req_id, unit=unit, req_type=req_type,
-                             description=desc, status=status, created_by=creator)
+        req = ServiceRequest(
+            req_id=req_id,
+            unit=unit,
+            req_type=req_type,
+            description=desc,
+            status=status,
+            created_by=created_by,
+        )
 
         is_new = self.request is None
         ok = self.on_save(req, is_new)
@@ -1153,21 +1339,17 @@ class AnnouncementWindow(tk.Toplevel):
         self.user = user
         self.announcements = self.store.get_announcements()
         self.on_update = on_update
-        self.geometry("650x380")
+        self.geometry("600x360")
 
         top = tk.Frame(self)
         top.pack(fill="x", padx=10, pady=5)
 
-        tk.Label(top, text="Announcements", font=("Arial", 12, "bold")).pack(side="left")
-
         if self.user.is_admin():
-            btn_frame = tk.Frame(top)
-            btn_frame.pack(side="right")
-            tk.Button(btn_frame, text="Add", width=10, command=self.add_announcement).pack(side="left", padx=3)
-            tk.Button(btn_frame, text="Edit", width=10, command=self.edit_announcement).pack(side="left", padx=3)
-            tk.Button(btn_frame, text="Delete", width=10, command=self.delete_announcement).pack(side="left", padx=3)
+            tk.Button(top, text="Add", command=self.add_announcement).pack(side="left", padx=5)
+            tk.Button(top, text="Edit", command=self.edit_announcement).pack(side="left", padx=5)
+            tk.Button(top, text="Delete", command=self.delete_announcement).pack(side="left", padx=5)
 
-        self.listbox = tk.Listbox(self, height=16)
+        self.listbox = tk.Listbox(self, height=14)
         self.listbox.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.refresh_listbox()
@@ -1185,7 +1367,7 @@ class AnnouncementWindow(tk.Toplevel):
         return self.announcements[idx[0]]
 
     def add_announcement(self):
-        AnnouncementForm(self, self.store, on_save=self.on_saved)
+        AnnouncementForm(self, self.store, on_save=self.on_saved, announcement=None)
 
     def edit_announcement(self):
         a = self.get_selected()
@@ -1278,19 +1460,11 @@ class CondoApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Condo Amenity & Service Hub")
-        # Make main window a bit larger so it feels more like an app dashboard
-        self.geometry("900x580")
-        self.minsize(820, 520)
+        # 让窗口看起来更像一个小桌面 app
+        self.geometry("960x540")
         self.store = DataStore()
         self.current_frame = None
         self.show_login()
-
-        # Simple menu bar (File -> Exit) for a more "app-like" feel
-        menubar = tk.Menu(self)
-        file_menu = tk.Menu(menubar, tearoff=False)
-        file_menu.add_command(label="Exit", command=self.destroy)
-        menubar.add_cascade(label="File", menu=file_menu)
-        self.config(menu=menubar)
 
     def clear_current_frame(self):
         if self.current_frame is not None:
