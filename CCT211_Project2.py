@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Condo Amenity & Service Hub - improved implementation with role-based UI
 Matches the proposal: login -> dashboard -> (amenities, packages, service requests, announcements)
@@ -9,6 +8,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import sqlite3
 from datetime import datetime
+from datetime import date, time as dtime
+import re
 
 
 # ------------------------- Domain Models ------------------------- #
@@ -24,28 +25,107 @@ class User:
 
 
 class AmenityBooking:
+    """
+    Rules：
+    1. Appointment Date:
+       - Must be in “YYYY-MM-DD” format, e.g. “2025-11-22”
+       - Must be a valid date
+       - Must be on or after 2025-11-22
+
+    2. Time:
+       - 24-hour format, must be “HH:MM”
+       - Hours 00–23, minutes 00–59
+       - start_time must precede end_time (comparison within the same day)
+    """
+
+    _MIN_BOOKING_DATE = date(2025, 11, 22)  # Earliest booking date
+
     def __init__(
         self,
         booking_id: int,
         unit: str,
         facility_type: str,
-        date_str: str,
-        start_time: str,
-        end_time: str,
+        date_str: str,      # 'YYYY-MM-DD'
+        start_time: str,    # 'HH:MM'
+        end_time: str,      # 'HH:MM'
         status: str = "Booked",
         created_by: str = "",
     ):
         self.id = booking_id
         self.unit = unit
         self.facility_type = facility_type
-        self.date = date_str        # "YYYY-MM-DD"
-        self.start_time = start_time  # "HH:MM"
-        self.end_time = end_time      # "HH:MM"
+
+        # Validate date and times
+        self.date = self._validate_and_normalize_date(date_str)
+        self.start_time = self._validate_time(start_time, field_name="start_time")
+        self.end_time = self._validate_time(end_time, field_name="end_time")
+
+        # Ensure the start time is earlier than the end time.
+        st_h, st_m = map(int, self.start_time.split(":"))
+        et_h, et_m = map(int, self.end_time.split(":"))
+        if dtime(st_h, st_m) >= dtime(et_h, et_m):
+            raise ValueError("start_time must be earlier than end_time")
+
         self.status = status
-        # Which user created this booking (for permissions)
         self.created_by = created_by
 
+    @classmethod
+    def _validate_and_normalize_date(cls, date_str: str) -> str:
+        """
+        Accept user input in “YYYY-MM-DD” format:
+        - Must conform to the regular expression format
+        - Must be a valid date
+        - Must be >= 22 November 2025
+        Return a standard “YYYY-MM-DD” string (i.e. isoformat)
+        """
+        # Must be YYYY-MM-DD
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+            raise ValueError("Date must be in 'YYYY-MM-DD' format, e.g., '2025-11-22'")
+
+        year_str, month_str, day_str = date_str.split("-")
+        year = int(year_str)
+        month = int(month_str)
+        day = int(day_str)
+
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            raise ValueError("Invalid date value")
+
+        # Must be on or after 2025-11-22
+        if candidate < cls._MIN_BOOKING_DATE:
+            raise ValueError("Booking date must be on or after 2025-11-22")
+
+        return candidate.isoformat()  # 'YYYY-MM-DD'
+
+    @staticmethod
+    def _validate_time(time_str: str, field_name: str = "time") -> str:
+        """
+        Time must be in “HH:MM” format (24-hour clock)
+        - Valid: “00:00”, “09:05”, “12:30”, “23:59”
+        - Invalid: “9:00”, “12:0”, “24:00”, 'aa:bb'
+        """
+        if not re.fullmatch(r"\d{2}:\d{2}", time_str):
+            raise ValueError(f"{field_name} must be in 'HH:MM' format, e.g., '12:30'")
+
+        hh_str, mm_str = time_str.split(":")
+        hour = int(hh_str)
+        minute = int(mm_str)
+
+        if not (0 <= hour <= 23):
+            raise ValueError(f"{field_name} hour must be between 00 and 23")
+
+        if not (0 <= minute <= 59):
+            raise ValueError(f"{field_name} minutes must be between 00 and 59")
+
+        _ = dtime(hour, minute)  # just to verify it's constructible
+
+        return time_str
+
     def to_dict(self) -> dict:
+        """
+        Export date as 'YYYY-MM-DD'.
+        """
         return {
             "id": self.id,
             "unit": self.unit,
@@ -166,7 +246,7 @@ class DataStore:
     """SQLite-based persistence for all entities."""
 
     def __init__(self, filename: str = "condo_data.sqlite3"):
-        # 连接数据库（没有会自动创建）
+        # Link to the database, if don't have one, it will automatically created one.
         self.conn = sqlite3.connect(filename)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
@@ -267,7 +347,6 @@ class DataStore:
         return [AmenityBooking.from_dict(dict(row)) for row in rows]
 
     def set_amenity_bookings(self, bookings):
-        # 这里保持和原 JSON 版本一样的“整表覆盖”语义
         cur = self.conn.cursor()
         cur.execute("DELETE FROM amenity_bookings")
         cur.executemany(
@@ -410,13 +489,12 @@ class DataStore:
 # ------------------------- Utility Functions ------------------------- #
 
 def parse_time_to_minutes(time_str: str) -> int:
-    """Convert 'HH:MM' into minutes since midnight."""
-    try:
-        h, m = time_str.split(":")
-        return int(h) * 60 + int(m)
-    except ValueError:
-        return -1
-
+        """Convert 'HH:MM' into minutes since midnight."""
+        try:
+            h, m = time_str.split(":")
+            return int(h) * 60 + int(m)
+        except ValueError:
+            return -1
 
 # ------------------------- GUI: Login & Dashboard ------------------------- #
 
@@ -425,34 +503,40 @@ class LoginFrame(tk.Frame):
         super().__init__(master, *args, **kwargs)
         self.app = app
         self.configure(padx=30, pady=30)
+        content = tk.Frame(self)
+        content.place(relx=0.5, rely=0.25, anchor="center")
 
-        tk.Label(self, text="Condo Amenity & Service Hub",
-                 font=("Arial", 18, "bold")).pack(pady=(0, 15))
+        tk.Label(content, text="Condo Amenity & Service Hub",
+         font=("Arial", 22, "bold")).pack(pady=(0, 15))
 
-        form = tk.Frame(self)
-        form.pack(fill="x")
+        content = tk.Frame(self)
+        content.place(relx=0.5, rely=0.55, anchor="center")
 
+        form = tk.Frame(content)
+        form.pack()
+        
         # Username
-        tk.Label(form, text="Username:").grid(row=0, column=0, sticky="e", pady=5, padx=5)
+        tk.Label(form, text="Username:").grid(row=0, column=0, sticky="w", pady=5, padx=5)
         self.username_entry = tk.Entry(form, width=25)
         self.username_entry.grid(row=0, column=1, pady=5, padx=5)
 
         # Unit
-        tk.Label(form, text="Unit:").grid(row=1, column=0, sticky="e", pady=5, padx=5)
+        tk.Label(form, text="Unit:").grid(row=1, column=0, sticky="w", pady=5, padx=5)
         self.unit_entry = tk.Entry(form, width=25)
         self.unit_entry.grid(row=1, column=1, pady=5, padx=5)
 
         # Role
-        tk.Label(self, text="Role (for demo):").pack(anchor="w", pady=(15, 5))
-        self.role_var = tk.StringVar(value="resident")
-        role_frame = tk.Frame(self)
-        role_frame.pack(anchor="w")
-        tk.Radiobutton(role_frame, text="Resident", variable=self.role_var,
-                       value="resident").pack(side="left")
-        tk.Radiobutton(role_frame, text="Admin", variable=self.role_var,
-                       value="admin").pack(side="left", padx=(10, 0))
+        tk.Label(form, text="Role:").grid(row=2, column=0, sticky="w", pady=5, padx=5)
 
-        tk.Button(self, text="Login", width=18, command=self.do_login).pack(pady=20)
+        role_frame = tk.Frame(form)
+        role_frame.grid(row=2, column=1, pady=5, padx=5)
+
+        self.role_var = tk.StringVar(value="resident")
+
+        tk.Radiobutton(role_frame, text="Resident", variable=self.role_var, value="resident").pack(side="left", padx=10)
+        tk.Radiobutton(role_frame, text="Admin", variable=self.role_var, value="admin").pack(side="left", padx=10)
+
+        tk.Button(content, text="Login", width=18, command=self.do_login).pack(pady=20)
 
     def do_login(self):
         username = self.username_entry.get().strip()
@@ -476,32 +560,99 @@ class DashboardFrame(tk.Frame):
         self.store = store
         self.configure(bg="#f2f2f2")
 
-        # Top bar
-        top_bar = tk.Frame(self, bg="#0f3b3a", height=50)
+        # ----- Modern flat button styles ----- #
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        # Logout button style (matches "Open" buttons)
+        style = ttk.Style()
+        style.configure(
+            "SidebarLogout.TButton",
+            padding=(18, 6),
+            relief="solid",
+            borderwidth=1,
+            focusthickness=0,
+            font=("Arial", 11, "bold"),
+            background="white",
+            foreground="black",
+        )
+        style.map(
+            "SidebarLogout.TButton",
+            background=[("active", "#f2f2f2"), ("pressed", "#e5e5e5")]
+        )
+
+        # Dashboard tile "Open" buttons
+        style.configure(
+            "Dashboard.TButton",
+            padding=(18, 6),
+            relief="solid",
+            borderwidth=1,
+            focusthickness=0,
+            font=("Arial", 11),
+            background="white",
+        )
+        style.map(
+            "Dashboard.TButton",
+            background=[("active", "#f2f2f2"), ("pressed", "#e5e5e5"),]
+        )
+
+        # Announcement "View all" / "Manage" buttons
+        style.configure(
+            "Banner.TButton",
+            padding=(12, 4),
+            relief="solid",
+            borderwidth=1,
+            focusthickness=0,
+            font=("Arial", 10),
+            background="#dbeff0",
+        )
+        style.map(
+            "Banner.TButton",
+            background=[("active", "#cfe4e4"), ("pressed", "#bcd9d9"),]
+        )
+
+        # ---------------- Top bar ---------------- #
+        top_bar = tk.Frame(self, bg="#0f3b3a", height=55)
         top_bar.pack(fill="x")
-
-        menu_lbl = tk.Label(top_bar, text="≡", fg="white", bg="#0f3b3a",
-                            font=("Arial", 18))
+        top_bar.pack_propagate(False)
+        
+        # Hamburger menu
+        menu_lbl = tk.Label(top_bar, text="≡", fg="white", bg="#0f3b3a", font=("Arial", 18), cursor="hand2")
         menu_lbl.pack(side="left", padx=10)
+        menu_lbl.bind("<Button-1>", lambda e: self.toggle_menu())
 
+        # Role label
         role_text = "Admin Console" if self.user.is_admin() else "Resident Portal"
-        tk.Label(top_bar, text=role_text, fg="white", bg="#0f3b3a",
-                 font=("Arial", 14, "bold")).pack(side="left", padx=10)
-
+        tk.Label(
+            top_bar,
+            text=role_text,
+            fg="white",
+            bg="#0f3b3a",
+            font=("Arial", 16, "bold"),
+        ).pack(side="left", padx=10)
+        
+        # Welcome bits
         welcome_bits = f"{self.user.username}"
         if self.user.unit:
             welcome_bits += f" • Unit {self.user.unit}"
-        tk.Label(top_bar, text=welcome_bits, fg="white", bg="#0f3b3a",
-                 font=("Arial", 11)).pack(side="right", padx=10)
+        tk.Label(
+            top_bar,
+            text=welcome_bits,
+            fg="white",
+            bg="#0f3b3a",
+            font=("Arial", 14),
+        ).pack(side="right", padx=10)
 
-        # Announcement card
+        # --------------- Announcement card --------------- #
         announce_frame = tk.Frame(self, bg="#d9eceb")
         announce_frame.pack(fill="x", padx=20, pady=(15, 10))
 
-        tk.Label(announce_frame, text="Today's Condo Announcement",
-                 bg="#d9eceb", font=("Arial", 12, "bold")).pack(
-            anchor="w", padx=10, pady=(8, 0)
-        )
+        tk.Label(
+            announce_frame,
+            text="Today's Condo Announcement",
+            bg="#d9eceb",
+            font=("Arial", 12, "bold"),
+        ).pack(anchor="w", padx=10, pady=(8, 0))
 
         self.announce_label = tk.Label(
             announce_frame,
@@ -515,17 +666,29 @@ class DashboardFrame(tk.Frame):
 
         btn_frame = tk.Frame(announce_frame, bg="#d9eceb")
         btn_frame.pack(fill="x", padx=10, pady=(0, 8))
-        tk.Button(btn_frame, text="View all", command=self.open_announcements) \
-            .pack(side="right")
+
+        # "View all" button (banner style)
+        ttk.Button(
+            btn_frame,
+            text="View all",
+            command=self.open_announcements,
+            style="Banner.TButton",
+        ).pack(side="right", padx=20)
+
+        # Admin-only "Manage" button
         if self.user.is_admin():
-            tk.Button(btn_frame, text="Manage", command=self.open_announcements) \
-                .pack(side="right", padx=(0, 5))
+            ttk.Button(
+                btn_frame,
+                text="Manage",
+                command=self.open_announcements,
+                style="Banner.TButton",
+            ).pack(side="right", padx=(0, 5))
 
         # Ensure at least one "today's update" style announcement for residents
         self.ensure_default_announcement()
         self.refresh_announcement_text()
 
-        # Tiles
+        # ---------------- Tiles container ---------------- #
         tiles_frame = tk.Frame(self, bg="#f2f2f2")
         tiles_frame.pack(fill="both", expand=True, padx=20, pady=10)
 
@@ -542,34 +705,82 @@ class DashboardFrame(tk.Frame):
         tiles_frame.columnconfigure(2, weight=1)
         tiles_frame.rowconfigure(0, weight=1)
 
-        # Amenity tile
-        tk.Label(amenity_tile, text="🏊", font=("Arial", 32), bg="white").pack(pady=(15, 5))
-        tk.Label(amenity_tile, text="Book Amenities", font=("Arial", 12, "bold"),
-                 bg="white").pack()
-        tk.Label(amenity_tile, text="Reserve gym, pool lanes, party room.",
-                 font=("Arial", 9), bg="white", fg="#555555", wraplength=200).pack(pady=(2, 4))
-        tk.Button(amenity_tile, text="Open",
-                  command=self.open_amenities).pack(pady=10)
+        # ---------------- Amenity tile ---------------- #
+        tk.Label(amenity_tile, text="🏊", font=("Arial", 32), bg="white").pack(
+            pady=(15, 5)
+        )
+        tk.Label(
+            amenity_tile,
+            text="Book Amenities",
+            font=("Arial", 12, "bold"),
+            bg="white",
+        ).pack()
+        tk.Label(
+            amenity_tile,
+            text="Reserve meeting room, pool lanes, party room.",
+            font=("Arial", 9),
+            bg="white",
+            fg="#555555",
+            wraplength=200,
+        ).pack(pady=(2, 4))
+        ttk.Button(
+            amenity_tile,
+            text="Open",
+            command=self.open_amenities,
+            style="Dashboard.TButton",
+        ).pack(pady=10)
 
-        # Package tile
-        tk.Label(pkg_tile, text="📦", font=("Arial", 32), bg="white").pack(pady=(15, 5))
-        tk.Label(pkg_tile, text="Packages", font=("Arial", 12, "bold"),
-                 bg="white").pack()
-        tk.Label(pkg_tile, text="Track deliveries and pickup status.",
-                 font=("Arial", 9), bg="white", fg="#555555", wraplength=200).pack(pady=(2, 4))
-        tk.Button(pkg_tile, text="Open",
-                  command=self.open_packages).pack(pady=10)
+        # ---------------- Package tile ---------------- #
+        tk.Label(pkg_tile, text="📦", font=("Arial", 32), bg="white").pack(
+            pady=(15, 5)
+        )
+        tk.Label(
+            pkg_tile,
+            text="Packages",
+            font=("Arial", 12, "bold"),
+            bg="white",
+        ).pack()
+        tk.Label(
+            pkg_tile,
+            text="Track deliveries and pickup status.",
+            font=("Arial", 9),
+            bg="white",
+            fg="#555555",
+            wraplength=200,
+        ).pack(pady=(2, 4))
+        ttk.Button(
+            pkg_tile,
+            text="Open",
+            command=self.open_packages,
+            style="Dashboard.TButton",
+        ).pack(pady=10)
 
-        # Service Requests tile
-        tk.Label(srv_tile, text="🛠", font=("Arial", 32), bg="white").pack(pady=(15, 5))
-        tk.Label(srv_tile, text="Service Requests", font=("Arial", 12, "bold"),
-                 bg="white").pack()
-        tk.Label(srv_tile, text="Submit repair and concierge requests.",
-                 font=("Arial", 9), bg="white", fg="#555555", wraplength=200).pack(pady=(2, 4))
-        tk.Button(srv_tile, text="Open",
-                  command=self.open_service_requests).pack(pady=10)
+        # ------------- Service Requests tile ------------- #
+        tk.Label(srv_tile, text="🛠", font=("Arial", 32), bg="white").pack(
+            pady=(15, 5)
+        )
+        tk.Label(
+            srv_tile,
+            text="Service Requests",
+            font=("Arial", 12, "bold"),
+            bg="white",
+        ).pack()
+        tk.Label(
+            srv_tile,
+            text="Submit repair and concierge requests.",
+            font=("Arial", 9),
+            bg="white",
+            fg="#555555",
+            wraplength=200,
+        ).pack(pady=(2, 4))
+        ttk.Button(
+            srv_tile,
+            text="Open",
+            command=self.open_service_requests,
+            style="Dashboard.TButton",
+        ).pack(pady=10)
 
-        # Simple admin summary bar so admin view feels different
+        # ---------- Simple admin summary bar ---------- #
         if self.user.is_admin():
             stats_frame = tk.Frame(self, bg="#f2f2f2")
             stats_frame.pack(fill="x", padx=20, pady=(0, 15))
@@ -581,14 +792,84 @@ class DashboardFrame(tk.Frame):
             def make_stat(parent, title, value):
                 card = tk.Frame(parent, bg="white", bd=1, relief="solid")
                 card.pack(side="left", expand=True, fill="x", padx=5)
-                tk.Label(card, text=title, bg="white",
-                         font=("Arial", 10, "bold")).pack(pady=(6, 0))
-                tk.Label(card, text=str(value), bg="white",
-                         font=("Arial", 14)).pack(pady=(0, 6))
+                tk.Label(
+                    card,
+                    text=title,
+                    bg="white",
+                    font=("Arial", 10, "bold"),
+                ).pack(pady=(6, 0))
+                tk.Label(
+                    card,
+                    text=str(value),
+                    bg="white",
+                    font=("Arial", 14),
+                ).pack(pady=(0, 6))
 
             make_stat(stats_frame, "Total Amenity Bookings", bookings_count)
             make_stat(stats_frame, "Total Packages", packages_count)
             make_stat(stats_frame, "Service Requests", requests_count)
+
+    def toggle_menu(self):
+        """Open/close the slide-out menu on the left."""
+        # If menu already open → close it
+        if hasattr(self, "menu_frame") and self.menu_frame.winfo_exists():
+            self.menu_frame.destroy()
+            return
+
+        # Create slide-out sidebar
+        self.menu_frame = tk.Frame(self, bg="#0f3b3a", width=220)
+        # Use relheight so it always matches window height
+        self.menu_frame.place(x=0, y=0, relheight=1.0)
+
+        # --- Top row: Close arrow + Title ---
+        top_row = tk.Frame(self.menu_frame, bg="#0f3b3a")
+        top_row.pack(fill="x", pady=(3, 3))
+
+        close_btn = tk.Label(
+            top_row,
+            text="⟵",
+            font=("Arial", 16),
+            bg="#0f3b3a",
+            fg="white",
+            cursor="hand2"
+        )
+        close_btn.pack(side="left", padx=20, pady=8)
+        close_btn.bind("<Button-1>", lambda e: self.close_menu())
+
+        tk.Label(
+            top_row,
+            text="Menu",
+            font=("Arial", 16, "bold"),
+            bg="#0f3b3a",
+            fg="white",
+        ).pack(side="left", padx=10, pady=10)
+
+        # --- Divider line ---
+        tk.Frame(self.menu_frame, bg="white", height=1).pack(
+            fill="x", pady=(5, 15)
+        )
+
+        # Spacer to push logout to bottom
+        tk.Frame(self.menu_frame, bg="#0f3b3a").pack(expand=True, fill="both")
+
+        # --- Logout button pinned at bottom ---
+        ttk.Button(
+            self.menu_frame,
+            text="Log Out",
+            style="SidebarLogout.TButton",
+            command=self.confirm_logout
+        ).pack(fill="x", padx=20, pady=25, side="bottom")
+
+    def close_menu(self):
+        """Close the slide-out menu if it exists."""
+        if hasattr(self, "menu_frame") and self.menu_frame.winfo_exists():
+            self.menu_frame.destroy()
+
+    def confirm_logout(self):
+        """Logout with confirmation dialog."""
+        if messagebox.askyesno("Logout", "Are you sure you want to log out?"):
+            self.close_menu()
+            self.app.logout()
 
     def ensure_default_announcement(self):
         announcements = self.store.get_announcements()
@@ -633,7 +914,7 @@ class DashboardFrame(tk.Frame):
 # ------------------------- GUI: Amenity Booking Window ------------------------- #
 
 class AmenityWindow(tk.Toplevel):
-    FACILITIES = ["Meeting Room", "Swimming Pool Lane", "Gym", "Party Room"]
+    FACILITIES = ["Meeting Room", "Swimming Pool Lane", "Party Room"]
 
     def __init__(self, master, store: DataStore, user: User):
         super().__init__(master)
@@ -642,7 +923,7 @@ class AmenityWindow(tk.Toplevel):
         self.user = user
         self.bookings = self.store.get_amenity_bookings()
 
-        self.geometry("750x420")
+        self.geometry("600x420")
 
         # Top controls
         top = tk.Frame(self)
@@ -717,9 +998,19 @@ class AmenityWindow(tk.Toplevel):
         if not b:
             messagebox.showwarning("Select", "Please select a booking to delete.")
             return
+
+        # ----- Permission check -----
+        # Admin: can delete anything
+        # Resident: only delete bookings that belong to their own unit
         if not self.user.is_admin():
-            messagebox.showerror("Permission", "Only admin/staff may delete bookings.")
-            return
+            if str(b.unit) != str(self.user.unit):
+                messagebox.showerror(
+                    "Permission",
+                    "You can only delete your own bookings."
+                )
+                return
+
+        # ----- Confirm deletion -----
         if messagebox.askyesno("Confirm", "Delete this booking permanently?"):
             self.bookings = [bk for bk in self.bookings if bk.id != b.id]
             self.save_and_refresh()
@@ -772,53 +1063,75 @@ class AmenityWindow(tk.Toplevel):
 
 
 class BookingForm(tk.Toplevel):
-    def __init__(self, master: AmenityWindow, store: DataStore, on_save, booking: AmenityBooking = None):
+    def __init__(
+        self,
+        master: AmenityWindow,
+        store: DataStore,
+        on_save,
+        booking: AmenityBooking = None,
+    ):
         super().__init__(master)
         self.title("Amenity Booking")
         self.store = store
         self.on_save = on_save
         self.booking = booking
 
-        self.geometry("360x300")
+        # Window size
+        self.geometry("600x420")
+        self.minsize(600, 420)
 
-        tk.Label(self, text="Unit:").grid(row=0, column=0, sticky="w", padx=10, pady=5)
-        self.unit_entry = tk.Entry(self)
-        self.unit_entry.grid(row=0, column=1, padx=10, pady=5)
+        # Use a form frame for nicer padding/alignment
+        form = tk.Frame(self)
+        form.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
 
-        tk.Label(self, text="Facility:").grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        form.columnconfigure(0, weight=0)   # labels
+        form.columnconfigure(1, weight=1)   # inputs
+
+        # ---------- row 0: Unit ----------
+        tk.Label(form, text="Unit:").grid(row=0, column=0, sticky="e", padx=(0, 10), pady=8)
+        self.unit_entry = tk.Entry(form)
+        self.unit_entry.grid(row=0, column=1, sticky="ew", padx=(0, 0), pady=8)
+
+        # ---------- row 1: Facility ----------
+        tk.Label(form, text="Facility:").grid(row=1, column=0, sticky="e", padx=(0, 10), pady=8)
         self.fac_var = tk.StringVar(value=AmenityWindow.FACILITIES[0])
-        self.fac_menu = ttk.Combobox(self, textvariable=self.fac_var, values=AmenityWindow.FACILITIES,
-                                     state="readonly")
-        self.fac_menu.grid(row=1, column=1, padx=10, pady=5)
+        self.fac_menu = ttk.Combobox(form, textvariable=self.fac_var, values=AmenityWindow.FACILITIES, state="readonly",)
+        self.fac_menu.grid(row=1, column=1, sticky="ew", padx=(0, 0), pady=8)
 
-        tk.Label(self, text="Date (YYYY-MM-DD):").grid(row=2, column=0, sticky="w", padx=10, pady=5)
-        self.date_entry = tk.Entry(self)
-        self.date_entry.grid(row=2, column=1, padx=10, pady=5)
+        # ---------- row 2: Date ----------
+        tk.Label(form, text="Date (YYYY-MM-DD):").grid(row=2, column=0, sticky="e", padx=(0, 10), pady=8)
+        self.date_entry = tk.Entry(form)
+        self.date_entry.grid(row=2, column=1, sticky="ew", padx=(0, 0), pady=8)
 
-        tk.Label(self, text="Start time (HH:MM):").grid(row=3, column=0, sticky="w", padx=10, pady=5)
-        self.start_entry = tk.Entry(self)
-        self.start_entry.grid(row=3, column=1, padx=10, pady=5)
+        # ---------- row 3: Start time ----------
+        tk.Label(form, text="Start time (HH:MM):").grid(row=3, column=0, sticky="e", padx=(0, 10), pady=8)
+        self.start_entry = tk.Entry(form)
+        self.start_entry.grid(row=3, column=1, sticky="ew", padx=(0, 0), pady=8)
 
-        tk.Label(self, text="End time (HH:MM):").grid(row=4, column=0, sticky="w", padx=10, pady=5)
-        self.end_entry = tk.Entry(self)
-        self.end_entry.grid(row=4, column=1, padx=10, pady=5)
+        # ---------- row 4: End time ----------
+        tk.Label(form, text="End time (HH:MM):").grid(row=4, column=0, sticky="e", padx=(0, 10), pady=8)
+        self.end_entry = tk.Entry(form)
+        self.end_entry.grid(row=4, column=1, sticky="ew", padx=(0, 0), pady=8)
 
-        tk.Label(self, text="Status:").grid(row=5, column=0, sticky="w", padx=10, pady=5)
+        # ---------- row 5: Status ----------
+        tk.Label(form, text="Status:").grid(row=5, column=0, sticky="e", padx=(0, 10), pady=8)
         self.status_var = tk.StringVar(value="Booked")
-        self.status_menu = ttk.Combobox(self, textvariable=self.status_var,
-                                        values=["Booked", "Cancelled"],
-                                        state="readonly")
-        self.status_menu.grid(row=5, column=1, padx=10, pady=5)
+        self.status_menu = ttk.Combobox(form, textvariable=self.status_var, values=["Booked", "Cancelled"], state="readonly",)
+        self.status_menu.grid(row=5, column=1, sticky="ew", padx=(0, 0), pady=8)
 
-        btn_frame = tk.Frame(self)
-        btn_frame.grid(row=6, column=0, columnspan=2, pady=10)
-        tk.Button(btn_frame, text="Save", command=self.save).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=5)
+        # ---------- row 6: Buttons ----------
+        btn_frame = tk.Frame(form)
+        btn_frame.grid(row=6, column=0, columnspan=2, pady=(20, 0))
+        tk.Button(btn_frame, text="Save", width=10, command=self.save).pack(side="left", padx=8)
+        tk.Button(btn_frame, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=8)
 
+        # ----- Prefill from booking / user -----
         user = getattr(master, "user", None)
 
         if self.booking:
-            # Editing an existing booking
+            # Editing existing booking
             self.unit_entry.insert(0, self.booking.unit)
             self.fac_var.set(self.booking.facility_type)
             self.date_entry.insert(0, self.booking.date)
@@ -826,7 +1139,7 @@ class BookingForm(tk.Toplevel):
             self.end_entry.insert(0, self.booking.end_time)
             self.status_var.set(self.booking.status)
         else:
-            # New booking: for residents, pre-fill their unit and lock it
+            # New booking: if resident has a unit, pre-fill + lock it
             if user and not user.is_admin() and user.unit:
                 self.unit_entry.insert(0, user.unit)
                 self.unit_entry.config(state="disabled")
@@ -843,47 +1156,49 @@ class BookingForm(tk.Toplevel):
             messagebox.showerror("Error", "All fields are required.")
             return
 
-        # Simple date/time validation
+        # 1) Quick time sanity check for nicer error messages
         try:
-            datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            messagebox.showerror("Error", "Date must be in YYYY-MM-DD format.")
+            start_m = parse_time_to_minutes(start)
+            end_m = parse_time_to_minutes(end)
+            if start_m < 0 or end_m < 0 or end_m <= start_m:
+                raise ValueError("Time range is invalid.")
+        except Exception as e:
+            messagebox.showerror("Invalid Time", str(e))
             return
 
-        start_m = parse_time_to_minutes(start)
-        end_m = parse_time_to_minutes(end)
-        if start_m < 0 or end_m < 0 or end_m <= start_m:
-            messagebox.showerror("Error", "Invalid time range.")
-            return
-
+        # 2) Create or reuse ID
         if self.booking:
             booking_id = self.booking.id
         else:
             booking_id = self.store.next_id("amenity_bookings")
 
-        # Determine creator
+        # 3) Creator
         user = getattr(self.master, "user", None)
-        creator = user.username if user is not None else ""
+        creator = user.username if user else ""
         if self.booking:
-            # Preserve original creator if editing
-            creator = getattr(self.booking, "created_by", creator)
+            creator = self.booking.created_by  # preserve original creator
 
-        booking = AmenityBooking(
-            booking_id=booking_id,
-            unit=unit,
-            facility_type=facility,
-            date_str=date_str,
-            start_time=start,
-            end_time=end,
-            status=status,
-            created_by=creator,
-        )
+        # 4) Let AmenityBooking do full validation (date + time formats + min date)
+        try:
+            booking = AmenityBooking(
+                booking_id=booking_id,
+                unit=unit,
+                facility_type=facility,
+                date_str=date_str,
+                start_time=start,
+                end_time=end,
+                status=status,
+                created_by=creator,
+            )
+        except ValueError as e:
+            # Any date/time validation errors from the model show up here
+            messagebox.showerror("Invalid Booking", str(e))
+            return
 
         is_new = self.booking is None
-        ok_to_close = self.on_save(booking, is_new)
-        if ok_to_close:
+        ok = self.on_save(booking, is_new)
+        if ok:
             self.destroy()
-
 
 # ------------------------- GUI: Packages Window ------------------------- #
 
@@ -895,7 +1210,7 @@ class PackageWindow(tk.Toplevel):
         self.user = user
         self.packages = self.store.get_packages()
         self.current_view = []
-        self.geometry("780x420")
+        self.geometry("1000x350")
 
         top = tk.Frame(self)
         top.pack(fill="x", padx=10, pady=5)
@@ -922,10 +1237,10 @@ class PackageWindow(tk.Toplevel):
         self.tree.heading("arrival", text="Arrival date")
         self.tree.heading("status", text="Status")
 
-        self.tree.column("unit", width=80, anchor="center")
-        self.tree.column("carrier", width=180)
+        self.tree.column("unit", width=40, anchor="center")
+        self.tree.column("carrier", width=120)
         self.tree.column("arrival", width=120, anchor="center")
-        self.tree.column("status", width=120, anchor="center")
+        self.tree.column("status", width=140, anchor="center")
 
         self.tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -946,10 +1261,32 @@ class PackageWindow(tk.Toplevel):
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.current_view = self.filtered_packages()
+        prefix = self.search_var.get().strip()   # What user typed in filter
+
+        # If no packages for this filter
+        if not self.current_view:
+            if prefix:      # Only show if filter was actually used
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        prefix,   # <-- Show the unit number here
+                        "",       # Carrier
+                        "",       # Arrival date
+                        "You currently don't receive any packages.",  # Status
+                    ),
+                )
+            return
+
+        # Otherwise, populate normally
         for idx, p in enumerate(self.current_view):
             status = "Picked up" if p.picked_up else "Waiting"
-            self.tree.insert("", "end", iid=str(idx),
-                             values=(p.unit, p.carrier, p.arrival_date, status))
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(p.unit, p.carrier, p.arrival_date, status),
+            )
 
     def get_selected(self):
         sel = self.tree.selection()
@@ -1094,7 +1431,6 @@ class PackageForm(tk.Toplevel):
         if ok:
             self.destroy()
 
-
 # ------------------------- GUI: Service Requests ------------------------- #
 
 class ServiceRequestWindow(tk.Toplevel):
@@ -1175,7 +1511,6 @@ class ServiceRequestWindow(tk.Toplevel):
         if not r:
             messagebox.showwarning("Select", "Please select a request.")
             return
-        # Residents 只能编辑自己提交的
         if (not self.user.is_admin()) and r.created_by != self.user.username:
             messagebox.showerror("Permission", "You can only edit your own requests.")
             return
@@ -1186,9 +1521,19 @@ class ServiceRequestWindow(tk.Toplevel):
         if not r:
             messagebox.showwarning("Select", "Please select a request.")
             return
+        
+        # ---- Permission logic ----
+        # Admin: can delete anything
+        # Resident: can delete ONLY requests they created
         if not self.user.is_admin():
-            messagebox.showerror("Permission", "Only admin/staff may delete requests.")
-            return
+            if r.created_by != self.user.username:
+                messagebox.showerror(
+                    "Permission",
+                    "You can only delete your own service requests."
+                )
+                return
+
+        # Confirm deletion
         if messagebox.askyesno("Confirm", "Delete this request?"):
             self.requests = [req for req in self.requests if req.id != r.id]
             self.save_and_refresh()
@@ -1235,26 +1580,65 @@ class ServiceRequestForm(tk.Toplevel):
         self.on_save = on_save
         self.request = request
 
-        self.geometry("360x260")
+        self.geometry("600x380")  # a bit wider
 
-        tk.Label(self, text="Unit:").grid(row=0, column=0, sticky="w", padx=10, pady=5)
-        self.unit_entry = tk.Entry(self)
-        self.unit_entry.grid(row=0, column=1, padx=10, pady=5)
+        # Let the window and form expand nicely
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        tk.Label(self, text="Type:").grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        form = tk.Frame(self, padx=30, pady=30)
+        form.grid(row=0, column=0, sticky="nsew")
+
+        # Make column 1 (inputs) stretch horizontally
+        form.columnconfigure(0, weight=0)
+        form.columnconfigure(1, weight=1)
+
+        # --- Unit ---
+        tk.Label(form, text="Unit:").grid(
+            row=0, column=0, sticky="e", padx=(0, 10), pady=5
+        )
+        self.unit_entry = tk.Entry(form)
+        self.unit_entry.grid(
+            row=0, column=1, sticky="we", pady=5
+        )
+
+        # --- Type ---
+        tk.Label(form, text="Type:").grid(
+            row=1, column=0, sticky="e", padx=(0, 10), pady=5
+        )
         self.type_var = tk.StringVar(value=ServiceRequestWindow.TYPES[0])
-        self.type_menu = ttk.Combobox(self, textvariable=self.type_var,
-                                      values=ServiceRequestWindow.TYPES, state="readonly")
-        self.type_menu.grid(row=1, column=1, padx=10, pady=5)
+        self.type_menu = ttk.Combobox(
+            form,
+            textvariable=self.type_var,
+            values=ServiceRequestWindow.TYPES,
+            state="readonly",
+        )
+        self.type_menu.grid(
+            row=1, column=1, sticky="we", pady=5
+        )
 
-        tk.Label(self, text="Description:").grid(row=2, column=0, sticky="nw", padx=10, pady=5)
-        self.desc_text = tk.Text(self, height=5, width=30)
-        self.desc_text.grid(row=2, column=1, padx=10, pady=5)
+        # --- Description ---
+        tk.Label(form, text="Description:").grid(
+            row=2, column=0, sticky="ne", padx=(0, 10), pady=(10, 5)
+        )
+        self.desc_text = tk.Text(form, height=8, width=40)
+        self.desc_text.grid(
+            row=2, column=1, sticky="nsew", pady=(10, 5)
+        )
 
-        btn_frame = tk.Frame(self)
-        btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
-        tk.Button(btn_frame, text="Save", command=self.save).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=5)
+        # Let the description row grow vertically
+        form.rowconfigure(2, weight=1)
+
+        # --- Buttons ---
+        btn_frame = tk.Frame(form)
+        btn_frame.grid(row=3, column=1, sticky="e", pady=(20, 0))
+
+        tk.Button(btn_frame, text="Save", command=self.save, width=10).pack(
+            side="left", padx=(0, 10)
+        )
+        tk.Button(btn_frame, text="Cancel", command=self.destroy, width=10).pack(
+            side="left"
+        )
 
         # Pre-fill data
         if self.request:
@@ -1328,7 +1712,6 @@ class StatusForm(tk.Toplevel):
         self.on_save(self.request)
         self.destroy()
 
-
 # ------------------------- GUI: Announcements ------------------------- #
 
 class AnnouncementWindow(tk.Toplevel):
@@ -1339,7 +1722,7 @@ class AnnouncementWindow(tk.Toplevel):
         self.user = user
         self.announcements = self.store.get_announcements()
         self.on_update = on_update
-        self.geometry("600x360")
+        self.geometry("900x360")
 
         top = tk.Frame(self)
         top.pack(fill="x", padx=10, pady=5)
@@ -1357,7 +1740,7 @@ class AnnouncementWindow(tk.Toplevel):
     def refresh_listbox(self):
         self.listbox.delete(0, tk.END)
         for a in self.announcements:
-            txt = f"#{a.id} | {a.created_at} | {a.title} | {a.content[:50]}"
+            txt = f"#{a.id} | {a.created_at} | {a.title} | {a.content}"
             self.listbox.insert(tk.END, txt)
 
     def get_selected(self):
@@ -1411,16 +1794,15 @@ class AnnouncementForm(tk.Toplevel):
         self.store = store
         self.on_save = on_save
         self.announcement = announcement
-
-        self.geometry("380x260")
+        self.geometry("600x260")
 
         tk.Label(self, text="Title:").grid(row=0, column=0, sticky="w", padx=10, pady=5)
-        self.title_entry = tk.Entry(self, width=35)
-        self.title_entry.grid(row=0, column=1, padx=10, pady=5)
+        self.title_entry = tk.Entry(self, width=50)
+        self.title_entry.grid(row=0, column=1, padx=10, pady=5, sticky="ew")
 
-        tk.Label(self, text="Content:").grid(row=1, column=0, sticky="nw", padx=10, pady=5)
-        self.content_text = tk.Text(self, width=30, height=5)
-        self.content_text.grid(row=1, column=1, padx=10, pady=5)
+        tk.Label(self, text="Content:").grid(row=1, column=0, sticky="nw", padx=10, pady=(5, 5))
+        self.content_text = tk.Text(self, width=50, height=8)
+        self.content_text.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
 
         btn_frame = tk.Frame(self)
         btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
@@ -1453,14 +1835,12 @@ class AnnouncementForm(tk.Toplevel):
         if ok:
             self.destroy()
 
-
 # ------------------------- Main Application ------------------------- #
 
 class CondoApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Condo Amenity & Service Hub")
-        # 让窗口看起来更像一个小桌面 app
         self.geometry("960x540")
         self.store = DataStore()
         self.current_frame = None
@@ -1481,6 +1861,15 @@ class CondoApp(tk.Tk):
         self.current_frame = DashboardFrame(self, app=self, user=user, store=self.store)
         self.current_frame.pack(fill="both", expand=True)
 
+    def logout(self):
+            # Close current frame
+            if self.current_frame:
+                self.current_frame.destroy()
+                self.current_frame = None
+            # Clear user session
+            self.user = None
+            # Return to login screen
+            self.show_login()
 
 if __name__ == "__main__":
     app = CondoApp()
